@@ -1,0 +1,248 @@
+# 效果确实比DQN好
+import gym
+import random
+import numpy as np
+import math
+import torch
+from torch import nn, optim
+from torch.nn import functional as F
+from collections import deque
+from torch.cuda.amp import GradScaler, autocast
+
+class Config:
+    def __init__(self):
+        self.env_name = 'CartPole-v1'
+        self.algo_name = 'Double_DQN'
+        self.train_eps = 500
+        self.test_eps = 5
+        self.max_steps = 100000
+        self.epsilon_start = 0.95
+        self.epsilon_end = 0.01
+        self.epsilon_decay = 800
+        self.lr = 0.001
+        self.gamma = 0.9
+        self.seed = random.randint(0, 100)
+        self.batch_size = 64
+        self.memory_capacity = 100000
+        self.hidden_dim = 256 # 隐藏层维度
+        self.target_update = 4 # 目标网络更新频率
+        self.n_states = None
+        self.n_actions = None
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = torch.device('cpu')
+
+    def show(self):
+        print('-' * 30 + '参数列表' + '-' * 30)
+        for k, v in vars(self).items():
+            print(k, '=', v)
+        print('-' * 60)
+# 增大随机性
+class NoisyLinear(nn.Module):
+    def __init__(self, in_features, out_features, sigma_init=0.017):
+        super(NoisyLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # 初始化参数
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.full((out_features, in_features), sigma_init))
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.full((out_features,), sigma_init))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        bound = 1 / math.sqrt(self.in_features)
+        nn.init.uniform_(self.weight_mu, -bound, bound)
+        nn.init.uniform_(self.bias_mu, -bound, bound)
+
+    def forward(self, x):
+        self.weight_epsilon.normal_()
+        self.bias_epsilon.normal_()
+        weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+        bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        return F.linear(x, weight, bias)
+    
+class MLP(nn.Module):
+    def __init__(self, n_states, n_actions, n_dims=128):
+        super(MLP, self).__init__()
+        self.fc1 = NoisyLinear(n_states, n_dims)
+        self.fc2 = NoisyLinear(n_dims, n_dims)
+        self.fc3 = NoisyLinear(n_dims, n_actions)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+        self.capacity = capacity
+
+    def push(self, transitions):
+        self.buffer.append(transitions)
+
+    # sequential=False表示随机采样，True表示序列采样
+    def sample(self, batch_size, sequential = False):
+        batch_size = min(batch_size, len(self.buffer))
+        if sequential:
+            rand_index = random.randint(0, len(self.buffer) - batch_size + 1)
+            batch = [self.buffer[i] for i in range(rand_index, rand_index + batch_size)]
+        else:
+            batch = random.sample(self.buffer, batch_size)
+        return zip(*batch)
+    
+    def size(self):
+        return len(self.buffer)
+    
+    def clear(self):
+        self.buffer.clear()
+
+class DQN:
+    def __init__(self, policy_net, target_net, memory, cfg):
+        self.sample_count = 0 # 记录采样次数
+        self.memory = memory
+        self.policy_net = policy_net
+        self.target_net = target_net
+        self.cfg = cfg
+        self.epsilon = cfg.epsilon_start
+        self.optimizer = optim.Adam(policy_net.parameters(), lr=cfg.lr)
+        self.loss = nn.MSELoss()
+        self.scaler = GradScaler() # 混合精度训练
+
+    @torch.no_grad()
+    def sample_action(self, state):
+        self.sample_count += 1
+        self.epsilon = self.cfg.epsilon_end + (self.cfg.epsilon_start - self.cfg.epsilon_end) * \
+                       np.exp(-1. * self.sample_count / self.cfg.epsilon_decay)
+        if np.random.uniform(0, 1) > self.epsilon:
+            # state是numpy数组，需要转换为tensor，unsqueeze是为了增加一个batch维度
+            state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.cfg.device)
+            # 选择Q值最大的动作，dim=1表示在行上取最大值，返回的是列索引
+            action = self.policy_net(state).argmax(dim=1).item()
+        else:
+            action = np.random.choice(self.cfg.n_actions)
+        return action
+    
+    @torch.no_grad()
+    def predict_action(self, state):
+        state = torch.tensor(np.array(state), device=self.cfg.device, dtype=torch.float32).unsqueeze(0)
+        action = self.policy_net(state).argmax(dim=1).item()
+        return action
+    
+    def update(self):
+        # 如果记忆库中的样本数量小于batch_size，直接返回
+        if self.memory.size() < self.cfg.batch_size:
+            return
+        
+        # 从记忆库中采样一个batch的数据
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = self.memory.sample(self.cfg.batch_size)
+        
+        # 将数据转换为tensor
+        state_batch = torch.tensor(state_batch, dtype=torch.float32).to(self.cfg.device)
+        action_batch = torch.tensor(action_batch, dtype=torch.long).to(self.cfg.device).unsqueeze(1)
+        reward_batch = torch.tensor(reward_batch, dtype=torch.float32).to(self.cfg.device)
+        next_state_batch = torch.tensor(next_state_batch, dtype=torch.float32).to(self.cfg.device)
+        done_batch = torch.tensor(done_batch, dtype=torch.float32).to(self.cfg.device)
+
+        with autocast():
+            if self.cfg.algo_name == 'DQN':  
+                # policy_net更新很快，target_net更新很慢，所以这里使用policy_net计算当前状态的Q值，使用target_net评估下一个状态的Q值，可以减少目标值的抖动     
+                # 普通DQN，使用策略网络计算当前状态的Q值，使用目标网络评估下一个状态的Q值，gather(1, action_batch)，1表示在列上取值，action_batch是动作索引
+                q_value = self.policy_net(state_batch).gather(1, action_batch)
+                next_q_value = self.target_net(next_state_batch).max(dim=1)[0].detach()
+            elif self.cfg.algo_name == 'Double_DQN':
+                # 使用行为网络选择下一个状态的动作
+                actions_next = self.policy_net(next_state_batch).argmax(dim=1)
+                # 使用目标网络评估这个动作的Q值
+                q_value = self.policy_net(state_batch).gather(1, action_batch)
+                # gather(1, actions_next.unsqueeze(1))，1表示在列上取值，actions_next.unsqueeze(1)是动作索引,squeeze(1)是为了去掉维度为1的维度,因为gather要求索引是一维的，detach()是为了阻断梯度
+                next_q_value = self.target_net(next_state_batch).gather(1, actions_next.unsqueeze(1)).squeeze(1).detach()
+                
+            expect_q_value = reward_batch + self.cfg.gamma * next_q_value * (1 - done_batch)
+            loss = F.mse_loss(q_value, expect_q_value.unsqueeze(1))
+
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+
+# 创建环境和智能体
+def env_agent_config(cfg):
+    # env = gym.make(cfg.env_name, render_mode = "human")
+    # human模式下，可以看到训练, 训练不需要渲染
+    env = gym.make(cfg.env_name)
+    print(f'观测空间 = {env.observation_space}')
+    print(f'动作空间 = {env.action_space}')
+    n_states = env.observation_space.shape[0]
+    n_actions = env.action_space.n
+    cfg.n_states = n_states
+    cfg.n_actions = n_actions
+    # jit.script是TorchScript的一种形式，可以将Python代码转换为TorchScript代码，提高代码的运行效率
+    policy_net = torch.jit.script(MLP(n_states, n_actions, cfg.hidden_dim).to(cfg.device)) 
+    target_net = torch.jit.script(MLP(n_states, n_actions, cfg.hidden_dim).to(cfg.device)) 
+    memory = ReplayBuffer(cfg.memory_capacity)
+    agent = DQN(policy_net, target_net, memory, cfg)
+    return env, agent
+
+def train(env, agent, cfg):
+    print('开始训练!')
+    cfg.show()
+    rewards, steps = [], []
+    for i in range(cfg.train_eps):
+        ep_reward, ep_step = 0.0, 0
+        state, _ = env.reset(seed=cfg.seed)
+        for _ in range(cfg.max_steps):
+            ep_step += 1
+            action = agent.sample_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            agent.memory.push((state, action, reward, next_state, done))
+            state = next_state
+            agent.update()
+            ep_reward += reward
+            if done:
+                break
+        if i % cfg.target_update == 0:
+            agent.target_net.load_state_dict(agent.policy_net.state_dict())
+        rewards.append(ep_reward)
+        steps.append(ep_step)
+        print(f'回合:{i + 1}/{cfg.train_eps}, 奖励:{ep_reward:.3f}, 步数:{ep_step:d}. epsilon:{agent.epsilon:.3f}')
+    print('完成训练!')
+    return rewards, steps
+
+def test(env, agent, cfg):
+    print('开始测试!')
+    rewards, steps = [], []
+    for i in range(cfg.test_eps):
+        ep_reward, ep_step = 0.0, 0
+        state, _ = env.reset(seed=cfg.seed)
+        for _ in range(cfg.max_steps):
+            ep_step += 1
+            action = agent.predict_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            state = next_state
+            ep_reward += reward
+            if terminated or truncated:
+                break
+        steps.append(ep_step)
+        rewards.append(ep_reward)
+        print(f'回合:{i + 1}/{cfg.test_eps}, 奖励:{ep_reward:.3f}')
+    print('结束测试!')
+    return rewards, steps
+
+if __name__ == '__main__':
+    cfg = Config()
+    env, agent = env_agent_config(cfg)
+    train_rewards, train_steps = train(env, agent, cfg)
+    # 测试用human模式，可以看到训练效果
+    env = gym.make(cfg.env_name, render_mode="human")
+    test_rewards, test_steps = test(env, agent, cfg)
+    env.close()
